@@ -1,5 +1,5 @@
 """
-Anti-DDoS Protection Server - Smart Bot Detection
+Anti-DDoS Protection Server - KHÔNG BAO GIỜ CHẶN BROWSER THẬT
 Deploy on Render.com for 24/7 operation
 """
 
@@ -14,11 +14,11 @@ import threading
 
 app = Flask(__name__)
 
-# Rate Limiter với nhiều mức độ
+# Rate Limiter nhẹ nhàng cho browser thật
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
-    default_limits=["200 per minute"],
+    default_limits=["500 per minute"],  # Tăng lên để không chặn người dùng thật
     storage_uri="memory://"
 )
 
@@ -28,120 +28,134 @@ blocked_ips = {}
 trusted_ips = set()
 stats = {'total': 0, 'blocked': 0, 'bot': 0, 'human': 0, 'start': time.time()}
 
-# Bot patterns - Comprehensive list
-BOT_PATTERNS = [
-    r'bot', r'crawler', r'spider', r'scraper', r'curl', r'wget',
-    r'python-requests', r'go-http', r'java', r'axios', r'node-fetch',
-    r'scrapy', r'phantom', r'headless', r'selenium', r'puppeteer'
-]
-
-# Legitimate browser patterns
+# Legitimate browser patterns - QUAN TRỌNG
 BROWSER_PATTERNS = [
-    r'mozilla/5\.0.*chrome', r'mozilla/5\.0.*safari', r'mozilla/5\.0.*firefox',
-    r'mozilla/5\.0.*edge', r'mozilla/5\.0.*opera'
+    r'mozilla/5\.0.*chrome',
+    r'mozilla/5\.0.*safari', 
+    r'mozilla/5\.0.*firefox',
+    r'mozilla/5\.0.*edge',
+    r'mozilla/5\.0.*opera',
+    r'mozilla/5\.0.*windows',
+    r'mozilla/5\.0.*macintosh',
+    r'mozilla/5\.0.*android',
+    r'mozilla/5\.0.*iphone'
 ]
 
-def smart_bot_detection(ip, user_agent, headers):
-    """Thuật toán thông minh phát hiện bot với độ chính xác cao"""
-    score = 0
-    signals = []
-    is_legit_browser = False
-    
-    # 1. CHECK USER AGENT - Phân tích chi tiết
+# Bot patterns - CHỈ chặn những cái này
+DEFINITE_BOT_PATTERNS = [
+    r'curl', r'wget', r'python-requests', r'go-http-client',
+    r'scrapy', r'httpclient', r'java/', r'ruby', r'perl',
+    r'bot[^a-z]', r'crawler', r'spider', r'scraper'
+]
+
+def is_real_browser(user_agent):
+    """Kiểm tra có phải browser thật KHÔNG"""
     if not user_agent:
-        score += 50
-        signals.append("No User-Agent")
-    else:
-        ua_lower = user_agent.lower()
+        return False
+    
+    ua_lower = user_agent.lower()
+    
+    # Kiểm tra browser thật - CHỈ CẦN 1 pattern khớp là OK
+    for pattern in BROWSER_PATTERNS:
+        if re.search(pattern, ua_lower):
+            return True
+    
+    return False
+
+def is_definite_bot(user_agent):
+    """Kiểm tra có CHẮC CHẮN là bot không"""
+    if not user_agent:
+        return True
+    
+    ua_lower = user_agent.lower()
+    
+    # CHỈ chặn khi tìm thấy bot pattern RÕ RÀNG
+    for pattern in DEFINITE_BOT_PATTERNS:
+        if re.search(pattern, ua_lower):
+            return True
+    
+    return False
+
+def analyze_request(ip, user_agent, headers):
+    """Phân tích request - ƯU TIÊN KHÔNG CHẶN BROWSER THẬT"""
+    
+    # BƯỚC 1: Kiểm tra browser thật NGAY LẬP TỨC
+    is_browser = is_real_browser(user_agent)
+    
+    if is_browser:
+        # BROWSER THẬT = CHO QUA LUÔN (trừ khi spam CỰC KỲ nặng)
+        current_time = time.time()
+        request_history[ip] = [t for t in request_history[ip] if current_time - t < 60]
+        request_history[ip].append(current_time)
+        req_count = len(request_history[ip])
         
-        # Kiểm tra browser thật
-        for pattern in BROWSER_PATTERNS:
-            if re.search(pattern, ua_lower):
-                is_legit_browser = True
-                score -= 20  # Bonus cho browser thật
-                signals.append("Legit Browser")
-                break
+        # CHỈ chặn khi spam THỰC SỰ quá đà (>300 req/min)
+        if req_count > 300:
+            return {
+                'verdict': 'BLOCK',
+                'reason': 'Browser spam quá nhanh',
+                'score': 100,
+                'is_browser': True,
+                'req_rate': req_count
+            }
         
-        # Kiểm tra bot patterns
-        if not is_legit_browser:
-            for pattern in BOT_PATTERNS:
-                if re.search(pattern, ua_lower):
-                    score += 40
-                    signals.append(f"Bot Pattern: {pattern}")
-                    break
+        # Cho qua tất cả browser thật
+        return {
+            'verdict': 'ALLOW',
+            'reason': 'Real browser detected',
+            'score': 0,
+            'is_browser': True,
+            'req_rate': req_count
+        }
     
-    # 2. CHECK HEADERS - Browser thật có đầy đủ headers
-    required_headers = ['Accept', 'Accept-Language', 'Accept-Encoding']
-    missing_headers = [h for h in required_headers if h not in headers]
+    # BƯỚC 2: Không phải browser → Kiểm tra có phải bot chắc chắn không
+    is_bot = is_definite_bot(user_agent)
     
-    if missing_headers and not is_legit_browser:
-        score += len(missing_headers) * 15
-        signals.append(f"Missing: {', '.join(missing_headers)}")
+    if not is_bot:
+        # Không phải browser NHƯNG cũng không phải bot rõ ràng
+        # → CHO QUA (có thể là API client, mobile app, etc.)
+        return {
+            'verdict': 'ALLOW',
+            'reason': 'Not a known bot',
+            'score': 20,
+            'is_browser': False,
+            'req_rate': 0
+        }
     
-    # Browser thật thường có nhiều headers
-    header_count = len(headers)
-    if is_legit_browser and header_count < 5:
-        score += 20  # Browser thật nhưng ít headers - đáng ngờ
-        signals.append("Few headers for browser")
-    
-    # 3. CHECK REQUEST RATE - Phân tích behavior
+    # BƯỚC 3: CHẮC CHẮN là bot → Kiểm tra rate
     current_time = time.time()
     request_history[ip] = [t for t in request_history[ip] if current_time - t < 60]
     request_history[ip].append(current_time)
-    
     req_count = len(request_history[ip])
     
-    if req_count > 100:  # >100 req/min = rõ ràng bot
-        score += 60
-        signals.append(f"Extreme rate: {req_count}/min")
-    elif req_count > 50:  # 50-100 req/min = nghi ngờ cao
-        score += 40
-        signals.append(f"High rate: {req_count}/min")
-    elif req_count > 30:  # 30-50 req/min = cảnh báo
-        score += 20
-        signals.append(f"Suspicious rate: {req_count}/min")
+    # Bot với rate cao = CHẶN
+    if req_count > 100:
+        return {
+            'verdict': 'BLOCK',
+            'reason': f'Bot with high rate: {req_count}/min',
+            'score': 100,
+            'is_browser': False,
+            'req_rate': req_count
+        }
+    elif req_count > 50:
+        return {
+            'verdict': 'WARN',
+            'reason': f'Bot detected: {req_count}/min',
+            'score': 60,
+            'is_browser': False,
+            'req_rate': req_count
+        }
     
-    # Người dùng thật thường có khoảng cách đều giữa requests
-    if len(request_history[ip]) > 5:
-        intervals = [request_history[ip][i] - request_history[ip][i-1] 
-                    for i in range(1, len(request_history[ip]))]
-        avg_interval = sum(intervals) / len(intervals)
-        
-        # Bot thường request đều đặn (interval gần như = nhau)
-        if avg_interval < 0.1 and req_count > 10:
-            score += 30
-            signals.append("Robotic timing pattern")
-    
-    # 4. CHECK CONNECTION - Fingerprinting
-    if 'Connection' in headers:
-        if headers['Connection'].lower() == 'close':
-            score += 10  # Bot thường dùng close
-            signals.append("Connection: close")
-    
-    # 5. TRUSTED IP - Whitelist
-    if ip in trusted_ips:
-        score -= 100  # Đảm bảo không bao giờ block
-        signals.append("Trusted IP")
-    
-    # 6. DECISION LOGIC với nhiều mức độ
-    if score >= 80:
-        verdict = "BLOCK_DEFINITE"  # Chắc chắn là bot
-    elif score >= 60:
-        verdict = "BLOCK_LIKELY"  # Khả năng cao là bot
-    elif score >= 40:
-        verdict = "WARN"  # Theo dõi thêm
-    else:
-        verdict = "ALLOW"  # Người dùng thật
-    
+    # Bot nhưng rate thấp → Cho qua (có thể là good bot như Google)
     return {
-        'score': max(0, score),  # Không âm
-        'verdict': verdict,
-        'signals': signals,
-        'is_browser': is_legit_browser,
+        'verdict': 'ALLOW',
+        'reason': 'Bot with low rate',
+        'score': 30,
+        'is_browser': False,
         'req_rate': req_count
     }
 
-def check_and_block(ip):
+def check_blocked(ip):
     """Kiểm tra IP có bị block không"""
     if ip in blocked_ips:
         block_time, duration = blocked_ips[ip]
@@ -153,49 +167,50 @@ def check_and_block(ip):
 
 @app.before_request
 def protect():
-    """Middleware bảo vệ mọi request"""
+    """Middleware bảo vệ - ƯU TIÊN KHÔNG CHẶN NGƯỜI DÙNG THẬT"""
     ip = get_remote_address()
     ua = request.headers.get('User-Agent', '')
     
     stats['total'] += 1
     
-    # Kiểm tra IP đã bị block
-    if check_and_block(ip):
+    # Kiểm tra whitelist TRƯỚC TIÊN
+    if ip in trusted_ips:
+        stats['human'] += 1
+        return  # Cho qua ngay lập tức
+    
+    # Kiểm tra đã bị block trước đó chưa
+    if check_blocked(ip):
         stats['blocked'] += 1
-        return jsonify({'error': 'Blocked', 'reason': 'IP temporarily blocked'}), 403
+        return jsonify({'error': 'Blocked', 'reason': 'IP temporarily blocked due to bot activity'}), 403
     
-    # Phân tích request với thuật toán thông minh
-    result = smart_bot_detection(ip, ua, request.headers)
+    # Phân tích request
+    result = analyze_request(ip, ua, request.headers)
     
-    # Quyết định dựa trên verdict
-    if result['verdict'] in ['BLOCK_DEFINITE', 'BLOCK_LIKELY']:
-        # Block với thời gian khác nhau
-        duration = 600 if result['verdict'] == 'BLOCK_DEFINITE' else 300
-        blocked_ips[ip] = (time.time(), duration)
+    # Quyết định
+    if result['verdict'] == 'BLOCK':
+        # CHỈ block khi THỰC SỰ chắc chắn
+        blocked_ips[ip] = (time.time(), 300)  # Block 5 phút
         stats['blocked'] += 1
         stats['bot'] += 1
         
-        log_event(ip, ua, result, 'BLOCKED')
+        print(f"[BLOCKED] {ip} | {result['reason']} | Rate: {result['req_rate']}/min")
         
         return jsonify({
             'error': 'Access Denied',
-            'score': result['score'],
-            'signals': result['signals'],
-            'blocked_duration': f"{duration}s"
+            'reason': result['reason'],
+            'rate': result['req_rate'],
+            'note': 'Nếu bạn là người dùng thật, vui lòng thử lại sau 5 phút'
         }), 403
     
     # Ghi nhận loại traffic
     if result['is_browser']:
         stats['human'] += 1
-    elif result['verdict'] == 'WARN':
+    else:
         stats['bot'] += 1
-        log_event(ip, ua, result, 'WARNING')
+        if result['verdict'] == 'WARN':
+            print(f"[WARNING] {ip} | {result['reason']}")
 
-def log_event(ip, ua, result, action):
-    """Ghi log ngắn gọn"""
-    print(f"[{action}] {ip} | Score: {result['score']} | {', '.join(result['signals'][:2])}")
-
-# Dashboard HTML - Tối ưu và gọn
+# Dashboard HTML - Gọn gàng
 DASHBOARD = """
 <!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -205,6 +220,7 @@ DASHBOARD = """
 body{font-family:system-ui,-apple-system,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;min-height:100vh;padding:20px}
 .container{max-width:1200px;margin:0 auto}
 h1{text-align:center;font-size:2.5em;margin-bottom:30px;text-shadow:2px 2px 4px rgba(0,0,0,0.3)}
+.alert{background:rgba(255,193,7,0.2);border:2px solid #ffc107;border-radius:10px;padding:15px;margin-bottom:20px;text-align:center}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:20px;margin-bottom:30px}
 .card{background:rgba(255,255,255,0.15);backdrop-filter:blur(10px);border-radius:15px;padding:25px;border:1px solid rgba(255,255,255,0.2);transition:transform 0.3s}
 .card:hover{transform:translateY(-5px)}
@@ -220,6 +236,9 @@ h1{text-align:center;font-size:2.5em;margin-bottom:30px;text-shadow:2px 2px 4px 
 <body>
 <div class="container">
 <h1>🛡️ Anti-DDoS Shield</h1>
+<div class="alert">
+⚠️ <strong>Chế độ an toàn:</strong> Hệ thống KHÔNG BAO GIỜ chặn browser thật (Chrome, Firefox, Safari, Edge)
+</div>
 <div class="stats">
 <div class="card"><div class="stat-label">📊 Total</div><div class="stat-val">{{stats.total}}</div></div>
 <div class="card"><div class="stat-label">🚫 Blocked</div><div class="stat-val">{{stats.blocked}}</div></div>
@@ -228,26 +247,26 @@ h1{text-align:center;font-size:2.5em;margin-bottom:30px;text-shadow:2px 2px 4px 
 </div>
 <div class="info">
 <h2>🟢 System Status</h2>
-<div class="status">ONLINE 24/7</div>
+<div class="status">ONLINE 24/7 - Safe Mode</div>
 <p style="margin-top:15px">Uptime: <strong>{{uptime}}</strong></p>
 <p>Block Rate: <strong>{{block_rate}}%</strong></p>
 </div>
 <div class="info">
-<h2>🎯 Smart Detection</h2>
-<div class="feature">✅ Multi-signal bot analysis</div>
-<div class="feature">✅ Behavioral pattern recognition</div>
-<div class="feature">✅ Browser fingerprinting</div>
-<div class="feature">✅ Adaptive rate limiting</div>
-<div class="feature">✅ False positive prevention</div>
+<h2>✅ Protection Policy</h2>
+<div class="feature">✅ Real browsers ALWAYS allowed (Chrome, Safari, Firefox, Edge)</div>
+<div class="feature">✅ Mobile browsers protected</div>
+<div class="feature">✅ Only block confirmed bots (curl, scrapy, etc.)</div>
+<div class="feature">✅ High rate limit: 500 req/min for humans</div>
+<div class="feature">⚠️ Only block at 300+ req/min for browsers</div>
 </div>
 <div class="info">
 <h2>🌐 API Endpoints</h2>
-<p style="margin:10px 0;font-family:monospace">GET / - Dashboard</p>
-<p style="margin:10px 0;font-family:monospace">GET /api/stats - Statistics JSON</p>
-<p style="margin:10px 0;font-family:monospace">GET /api/test - Protected endpoint</p>
+<p style="margin:10px 0;font-family:monospace">GET / - Dashboard (You are here!)</p>
+<p style="margin:10px 0;font-family:monospace">GET /api/stats - Statistics</p>
+<p style="margin:10px 0;font-family:monospace">GET /api/test - Test endpoint</p>
 <p style="margin:10px 0;font-family:monospace">POST /api/data - Submit data</p>
 </div>
-<button class="btn" onclick="location.reload()">🔄 Refresh</button>
+<button class="btn" onclick="location.reload()">🔄 Refresh Stats</button>
 </div>
 <script>setTimeout(()=>location.reload(),15000)</script>
 </body></html>
@@ -270,12 +289,20 @@ def get_stats():
     })
 
 @app.route('/api/test')
-@limiter.limit("30 per minute")
 def test():
-    return jsonify({'status': 'success', 'message': 'You are verified!', 'ip': get_remote_address()})
+    ip = get_remote_address()
+    ua = request.headers.get('User-Agent', '')
+    is_browser = is_real_browser(ua)
+    return jsonify({
+        'status': 'success',
+        'message': 'You are verified!',
+        'ip': ip,
+        'user_agent': ua,
+        'detected_as': 'Real Browser ✅' if is_browser else 'API Client/Bot',
+        'note': 'Real browsers are never blocked!'
+    })
 
 @app.route('/api/data', methods=['POST'])
-@limiter.limit("50 per minute")
 def submit():
     return jsonify({'status': 'success', 'received': request.get_json() or {}})
 
@@ -284,7 +311,6 @@ def health():
     return jsonify({'status': 'healthy', 'uptime': int(time.time() - stats['start'])})
 
 @app.route('/api/whitelist/<ip>')
-@limiter.limit("5 per hour")
 def whitelist(ip):
     """Thêm IP vào whitelist"""
     trusted_ips.add(ip)
@@ -295,12 +321,10 @@ def cleanup():
     while True:
         time.sleep(300)
         now = time.time()
-        # Cleanup old tracking data
         for ip in list(request_history.keys()):
             request_history[ip] = [t for t in request_history[ip] if now - t < 60]
             if not request_history[ip]:
                 del request_history[ip]
-        # Cleanup expired blocks
         for ip in list(blocked_ips.keys()):
             block_time, duration = blocked_ips[ip]
             if now - block_time >= duration:
