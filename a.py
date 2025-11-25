@@ -1,337 +1,434 @@
 """
-Anti-DDoS Protection Server - KHÔNG BAO GIỜ CHẶN BROWSER THẬT
-Deploy on Render.com for 24/7 operation
+Anti-DDoS Shield - THỰC SỰ PHÂN BIỆT BOT VS NGƯỜI
+- Browser fingerprinting
+- JavaScript challenge THỰC SỰ
+- Challenge page chỉ browser mới qua được
+- Bot/Benchmark tool = CHẶN NGAY
 """
 
-from flask import Flask, request, jsonify, render_template_string
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
+from flask import Flask, request, jsonify, make_response
 from collections import defaultdict
 import time
-import re
+import hashlib
+import secrets
 import os
-import threading
+import json
 
 app = Flask(__name__)
 
-# Rate Limiter nhẹ nhàng cho browser thật
-limiter = Limiter(
-    app=app,
-    key_func=get_remote_address,
-    default_limits=["500 per minute"],  # Tăng lên để không chặn người dùng thật
-    storage_uri="memory://"
-)
+# Storage
+verified_browsers = {}  # token -> {ip, fingerprint, expires}
+request_tracker = defaultdict(list)  # ip -> [timestamps]
+blocked_ips = {}  # ip -> block_until
+challenge_tracker = {}  # ip -> {attempts, last_attempt}
+stats = {'total': 0, 'browser': 0, 'bot': 0, 'blocked': 0, 'challenged': 0}
 
-# Data storage
-request_history = defaultdict(list)
-blocked_ips = {}
-trusted_ips = set()
-stats = {'total': 0, 'blocked': 0, 'bot': 0, 'human': 0, 'start': time.time()}
+# Config
+CHALLENGE_TIMEOUT = 10  # Browser phải hoàn thành trong 10s
+VERIFIED_DURATION = 3600  # Token valid 1h
+BLOCK_DURATION = 600  # Block 10 phút
+BOT_RATE_LIMIT = 10  # Bot chỉ được 10 req/min
+BROWSER_RATE_LIMIT = 500  # Browser được 500 req/min
 
-# Legitimate browser patterns - QUAN TRỌNG
-BROWSER_PATTERNS = [
-    r'mozilla/5\.0.*chrome',
-    r'mozilla/5\.0.*safari', 
-    r'mozilla/5\.0.*firefox',
-    r'mozilla/5\.0.*edge',
-    r'mozilla/5\.0.*opera',
-    r'mozilla/5\.0.*windows',
-    r'mozilla/5\.0.*macintosh',
-    r'mozilla/5\.0.*android',
-    r'mozilla/5\.0.*iphone'
-]
-
-# Bot patterns - CHỈ chặn những cái này
-DEFINITE_BOT_PATTERNS = [
-    r'curl', r'wget', r'python-requests', r'go-http-client',
-    r'scrapy', r'httpclient', r'java/', r'ruby', r'perl',
-    r'bot[^a-z]', r'crawler', r'spider', r'scraper'
-]
-
-def is_real_browser(user_agent):
-    """Kiểm tra có phải browser thật KHÔNG"""
+def is_browser(user_agent):
+    """Kiểm tra User-Agent có GIỐNG browser không (nhưng chưa chắc thật)"""
     if not user_agent:
         return False
-    
-    ua_lower = user_agent.lower()
-    
-    # Kiểm tra browser thật - CHỈ CẦN 1 pattern khớp là OK
-    for pattern in BROWSER_PATTERNS:
-        if re.search(pattern, ua_lower):
-            return True
-    
-    return False
+    ua = user_agent.lower()
+    browsers = ['mozilla/5.0', 'chrome/', 'safari/', 'firefox/', 'edge/', 'opera/']
+    return any(b in ua for b in browsers)
 
-def is_definite_bot(user_agent):
-    """Kiểm tra có CHẮC CHẮN là bot không"""
+def is_obvious_bot(user_agent):
+    """Kiểm tra CHẮC CHẮN là bot"""
     if not user_agent:
         return True
-    
-    ua_lower = user_agent.lower()
-    
-    # CHỈ chặn khi tìm thấy bot pattern RÕ RÀNG
-    for pattern in DEFINITE_BOT_PATTERNS:
-        if re.search(pattern, ua_lower):
-            return True
-    
-    return False
+    ua = user_agent.lower()
+    bots = ['curl', 'wget', 'python', 'go-http', 'java', 'perl', 'ruby', 'scrapy', 
+            'httpclient', 'okhttp', 'axios', 'node-fetch', 'http.rb', 'rest-client',
+            'benchmark', 'siege', 'ab/', 'jmeter', 'gatling', 'locust', 'wrk']
+    return any(b in ua for b in bots)
 
-def analyze_request(ip, user_agent, headers):
-    """Phân tích request - ƯU TIÊN KHÔNG CHẶN BROWSER THẬT"""
+def check_rate(ip, is_verified_browser):
+    """Rate limiting"""
+    now = time.time()
+    request_tracker[ip] = [t for t in request_tracker[ip] if now - t < 60]
+    request_tracker[ip].append(now)
     
-    # BƯỚC 1: Kiểm tra browser thật NGAY LẬP TỨC
-    is_browser = is_real_browser(user_agent)
+    count = len(request_tracker[ip])
+    limit = BROWSER_RATE_LIMIT if is_verified_browser else BOT_RATE_LIMIT
     
-    if is_browser:
-        # BROWSER THẬT = CHO QUA LUÔN (trừ khi spam CỰC KỲ nặng)
-        current_time = time.time()
-        request_history[ip] = [t for t in request_history[ip] if current_time - t < 60]
-        request_history[ip].append(current_time)
-        req_count = len(request_history[ip])
-        
-        # CHỈ chặn khi spam THỰC SỰ quá đà (>300 req/min)
-        if req_count > 300:
-            return {
-                'verdict': 'BLOCK',
-                'reason': 'Browser spam quá nhanh',
-                'score': 100,
-                'is_browser': True,
-                'req_rate': req_count
-            }
-        
-        # Cho qua tất cả browser thật
-        return {
-            'verdict': 'ALLOW',
-            'reason': 'Real browser detected',
-            'score': 0,
-            'is_browser': True,
-            'req_rate': req_count
-        }
-    
-    # BƯỚC 2: Không phải browser → Kiểm tra có phải bot chắc chắn không
-    is_bot = is_definite_bot(user_agent)
-    
-    if not is_bot:
-        # Không phải browser NHƯNG cũng không phải bot rõ ràng
-        # → CHO QUA (có thể là API client, mobile app, etc.)
-        return {
-            'verdict': 'ALLOW',
-            'reason': 'Not a known bot',
-            'score': 20,
-            'is_browser': False,
-            'req_rate': 0
-        }
-    
-    # BƯỚC 3: CHẮC CHẮN là bot → Kiểm tra rate
-    current_time = time.time()
-    request_history[ip] = [t for t in request_history[ip] if current_time - t < 60]
-    request_history[ip].append(current_time)
-    req_count = len(request_history[ip])
-    
-    # Bot với rate cao = CHẶN
-    if req_count > 100:
-        return {
-            'verdict': 'BLOCK',
-            'reason': f'Bot with high rate: {req_count}/min',
-            'score': 100,
-            'is_browser': False,
-            'req_rate': req_count
-        }
-    elif req_count > 50:
-        return {
-            'verdict': 'WARN',
-            'reason': f'Bot detected: {req_count}/min',
-            'score': 60,
-            'is_browser': False,
-            'req_rate': req_count
-        }
-    
-    # Bot nhưng rate thấp → Cho qua (có thể là good bot như Google)
-    return {
-        'verdict': 'ALLOW',
-        'reason': 'Bot with low rate',
-        'score': 30,
-        'is_browser': False,
-        'req_rate': req_count
-    }
+    return count <= limit, count
 
-def check_blocked(ip):
-    """Kiểm tra IP có bị block không"""
+def is_blocked(ip):
+    """Check IP có bị block không"""
     if ip in blocked_ips:
-        block_time, duration = blocked_ips[ip]
-        if time.time() - block_time < duration:
+        if time.time() < blocked_ips[ip]:
             return True
         else:
             del blocked_ips[ip]
     return False
 
-@app.before_request
-def protect():
-    """Middleware bảo vệ - ƯU TIÊN KHÔNG CHẶN NGƯỜI DÙNG THẬT"""
-    ip = get_remote_address()
-    ua = request.headers.get('User-Agent', '')
-    
-    stats['total'] += 1
-    
-    # Kiểm tra whitelist TRƯỚC TIÊN
-    if ip in trusted_ips:
-        stats['human'] += 1
-        return  # Cho qua ngay lập tức
-    
-    # Kiểm tra đã bị block trước đó chưa
-    if check_blocked(ip):
-        stats['blocked'] += 1
-        return jsonify({'error': 'Blocked', 'reason': 'IP temporarily blocked due to bot activity'}), 403
-    
-    # Phân tích request
-    result = analyze_request(ip, ua, request.headers)
-    
-    # Quyết định
-    if result['verdict'] == 'BLOCK':
-        # CHỈ block khi THỰC SỰ chắc chắn
-        blocked_ips[ip] = (time.time(), 300)  # Block 5 phút
-        stats['blocked'] += 1
-        stats['bot'] += 1
-        
-        print(f"[BLOCKED] {ip} | {result['reason']} | Rate: {result['req_rate']}/min")
-        
-        return jsonify({
-            'error': 'Access Denied',
-            'reason': result['reason'],
-            'rate': result['req_rate'],
-            'note': 'Nếu bạn là người dùng thật, vui lòng thử lại sau 5 phút'
-        }), 403
-    
-    # Ghi nhận loại traffic
-    if result['is_browser']:
-        stats['human'] += 1
-    else:
-        stats['bot'] += 1
-        if result['verdict'] == 'WARN':
-            print(f"[WARNING] {ip} | {result['reason']}")
+def block_ip(ip):
+    """Block IP"""
+    blocked_ips[ip] = time.time() + BLOCK_DURATION
 
-# Dashboard HTML - Gọn gàng
-DASHBOARD = """
-<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Anti-DDoS Shield</title>
+def verify_challenge_response(ip, challenge_id, answer):
+    """Verify challenge - CHỈ browser thật mới trả lời đúng được"""
+    if ip not in challenge_tracker:
+        return False
+    
+    challenge_data = challenge_tracker[ip]
+    
+    # Check timeout - bot thường trả lời tức thì, browser mất ~2-5s
+    time_taken = time.time() - challenge_data['issued_at']
+    if time_taken < 1.5:  # Quá nhanh = bot
+        return False
+    if time_taken > CHALLENGE_TIMEOUT:  # Quá chậm = timeout
+        return False
+    
+    # Check answer
+    expected = challenge_data['answer']
+    if str(answer) != str(expected):
+        return False
+    
+    return True
+
+# Challenge Page với JavaScript thực sự
+CHALLENGE_PAGE = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Checking your browser</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:system-ui,-apple-system,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;min-height:100vh;padding:20px}
-.container{max-width:1200px;margin:0 auto}
-h1{text-align:center;font-size:2.5em;margin-bottom:30px;text-shadow:2px 2px 4px rgba(0,0,0,0.3)}
-.alert{background:rgba(255,193,7,0.2);border:2px solid #ffc107;border-radius:10px;padding:15px;margin-bottom:20px;text-align:center}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:20px;margin-bottom:30px}
-.card{background:rgba(255,255,255,0.15);backdrop-filter:blur(10px);border-radius:15px;padding:25px;border:1px solid rgba(255,255,255,0.2);transition:transform 0.3s}
-.card:hover{transform:translateY(-5px)}
-.stat-val{font-size:2.5em;font-weight:bold;margin:10px 0}
-.stat-label{font-size:0.9em;opacity:0.9;text-transform:uppercase}
-.info{background:rgba(255,255,255,0.15);backdrop-filter:blur(10px);border-radius:15px;padding:25px;margin-top:20px;border:1px solid rgba(255,255,255,0.2)}
-.feature{padding:12px;margin:8px 0;background:rgba(255,255,255,0.1);border-radius:8px;border-left:4px solid #4CAF50}
-.btn{background:#4CAF50;color:#fff;border:none;padding:15px 40px;border-radius:25px;font-size:1em;cursor:pointer;margin:20px auto;display:block;transition:background 0.3s}
-.btn:hover{background:#45a049}
-.status{display:inline-block;padding:8px 20px;border-radius:20px;background:#4CAF50;font-weight:bold;margin:10px 0}
+body{font-family:-apple-system,system-ui,sans-serif;background:#f5f5f5;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.container{text-align:center;max-width:600px;padding:40px;background:white;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}
+.shield{width:80px;height:80px;background:linear-gradient(135deg,#667eea,#764ba2);border-radius:50%;margin:0 auto 20px;display:flex;align-items:center;justify-content:center;font-size:40px;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.05)}}
+h1{font-size:24px;color:#333;margin-bottom:10px}
+p{color:#666;margin-bottom:20px}
+.spinner{width:50px;height:50px;border:4px solid #f3f3f3;border-top:4px solid #667eea;border-radius:50%;margin:20px auto;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+#challenge{display:none;margin-top:20px}
+.math{font-size:32px;font-weight:bold;color:#333;margin:20px 0}
+input{padding:12px;font-size:18px;border:2px solid #ddd;border-radius:8px;width:200px;text-align:center}
+button{background:#667eea;color:white;border:none;padding:12px 30px;font-size:16px;border-radius:8px;cursor:pointer;margin-top:15px}
+button:hover{background:#5568d3}
+.error{color:#e74c3c;margin-top:10px;display:none}
 </style>
 </head>
 <body>
 <div class="container">
-<h1>🛡️ Anti-DDoS Shield</h1>
-<div class="alert">
-⚠️ <strong>Chế độ an toàn:</strong> Hệ thống KHÔNG BAO GIỜ chặn browser thật (Chrome, Firefox, Safari, Edge)
+<div class="shield">🛡️</div>
+<h1>Checking your browser...</h1>
+<p>This process is automatic. Please wait.</p>
+<div class="spinner" id="spinner"></div>
+<div id="challenge">
+<p>To continue, please solve this simple math problem:</p>
+<div class="math" id="question"></div>
+<input type="number" id="answer" placeholder="Your answer" autofocus>
+<button onclick="submitAnswer()">Submit</button>
+<div class="error" id="error">Incorrect. Please try again.</div>
 </div>
+</div>
+<script>
+// Collect browser fingerprint
+var fingerprint = {
+    screen: screen.width + 'x' + screen.height,
+    timezone: new Date().getTimezoneOffset(),
+    language: navigator.language,
+    platform: navigator.platform,
+    cores: navigator.hardwareConcurrency || 0,
+    memory: navigator.deviceMemory || 0,
+    canvas: (function(){
+        try{
+            var c=document.createElement('canvas');
+            var ctx=c.getContext('2d');
+            ctx.textBaseline='top';
+            ctx.font='14px Arial';
+            ctx.fillText('Browser',2,2);
+            return c.toDataURL().slice(-50);
+        }catch(e){return 'none'}
+    })()
+};
+
+// Show challenge after 2 seconds
+setTimeout(function(){
+    document.getElementById('spinner').style.display = 'none';
+    document.getElementById('challenge').style.display = 'block';
+    
+    // Generate math question
+    var a = Math.floor(Math.random() * 20) + 1;
+    var b = Math.floor(Math.random() * 20) + 1;
+    document.getElementById('question').textContent = a + ' + ' + b + ' = ?';
+    
+    window.challengeData = {
+        a: a,
+        b: b,
+        answer: a + b,
+        fingerprint: fingerprint,
+        startTime: Date.now()
+    };
+}, 2000);
+
+function submitAnswer(){
+    var userAnswer = document.getElementById('answer').value;
+    var timeTaken = Date.now() - window.challengeData.startTime;
+    
+    if(userAnswer == window.challengeData.answer){
+        // Correct! Submit to server
+        fetch('/verify-challenge', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                challenge_id: '{{CHALLENGE_ID}}',
+                answer: userAnswer,
+                fingerprint: window.challengeData.fingerprint,
+                time_taken: timeTaken
+            })
+        })
+        .then(r => r.json())
+        .then(data => {
+            if(data.verified){
+                document.cookie = 'browser_token=' + data.token + ';path=/;max-age=3600';
+                window.location.href = '{{REDIRECT}}';
+            }else{
+                document.getElementById('error').style.display = 'block';
+            }
+        });
+    }else{
+        document.getElementById('error').style.display = 'block';
+        setTimeout(function(){
+            document.getElementById('error').style.display = 'none';
+        }, 2000);
+    }
+}
+
+// Allow Enter key
+document.getElementById('answer').addEventListener('keypress', function(e){
+    if(e.key === 'Enter') submitAnswer();
+});
+</script>
+</body>
+</html>"""
+
+# Blocked Page
+BLOCKED_PAGE = """<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><title>Access Denied</title>
+<style>
+*{margin:0;padding:0}body{font-family:system-ui;background:#1a1a1a;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center}
+.box{max-width:500px;padding:40px}.icon{font-size:80px;margin-bottom:20px}h1{color:#ef4444;margin-bottom:15px}
+.info{background:rgba(255,255,255,0.1);border-radius:10px;padding:20px;margin-top:20px;text-align:left}
+.row{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.1)}
+.row:last-child{border:none}
+</style>
+</head>
+<body>
+<div class="box">
+<div class="icon">🚫</div>
+<h1>Access Denied</h1>
+<p>Your request has been blocked by our DDoS protection system.</p>
+<div class="info">
+<div class="row"><span>Your IP:</span><strong>{{IP}}</strong></div>
+<div class="row"><span>Reason:</span><strong>{{REASON}}</strong></div>
+<div class="row"><span>Requests:</span><strong>{{COUNT}}/min</strong></div>
+<div class="row"><span>Unblock in:</span><strong>10 minutes</strong></div>
+</div>
+<p style="margin-top:20px;color:#888;font-size:14px">
+If you're a real user and believe this is a mistake, please wait and try again.
+</p>
+</div>
+</body>
+</html>"""
+
+# Dashboard
+DASHBOARD = """<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Anti-DDoS Dashboard</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;min-height:100vh;padding:20px}
+.container{max-width:1200px;margin:0 auto}
+h1{text-align:center;font-size:2.5em;margin-bottom:30px;text-shadow:2px 2px 4px rgba(0,0,0,0.3)}
+.alert{background:rgba(76,175,80,0.3);border:2px solid #4CAF50;border-radius:10px;padding:15px;margin-bottom:20px;text-align:center;font-weight:bold}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:20px;margin-bottom:30px}
+.card{background:rgba(255,255,255,0.15);backdrop-filter:blur(10px);border-radius:15px;padding:25px;border:1px solid rgba(255,255,255,0.2);transition:transform 0.3s}
+.card:hover{transform:translateY(-5px)}
+.val{font-size:2.5em;font-weight:bold;margin:10px 0}
+.label{font-size:0.9em;opacity:0.9;text-transform:uppercase}
+.info{background:rgba(255,255,255,0.15);backdrop-filter:blur(10px);border-radius:15px;padding:25px;margin-top:20px;border:1px solid rgba(255,255,255,0.2)}
+.feature{padding:12px;margin:8px 0;background:rgba(255,255,255,0.1);border-radius:8px;border-left:4px solid #4CAF50}
+.btn{background:#4CAF50;color:#fff;border:none;padding:15px 40px;border-radius:25px;font-size:1em;cursor:pointer;margin:20px auto;display:block;transition:background 0.3s}
+.btn:hover{background:#45a049}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>🛡️ Anti-DDoS Shield Pro</h1>
+<div class="alert">✅ Real Browser Detection Active - Bots/Benchmarks BLOCKED</div>
 <div class="stats">
-<div class="card"><div class="stat-label">📊 Total</div><div class="stat-val">{{stats.total}}</div></div>
-<div class="card"><div class="stat-label">🚫 Blocked</div><div class="stat-val">{{stats.blocked}}</div></div>
-<div class="card"><div class="stat-label">🤖 Bots</div><div class="stat-val">{{stats.bot}}</div></div>
-<div class="card"><div class="stat-label">✅ Humans</div><div class="stat-val">{{stats.human}}</div></div>
+<div class="card"><div class="label">📊 Total Requests</div><div class="val">{{TOTAL}}</div></div>
+<div class="card"><div class="label">✅ Real Browsers</div><div class="val">{{BROWSER}}</div></div>
+<div class="card"><div class="label">🤖 Bots Detected</div><div class="val">{{BOT}}</div></div>
+<div class="card"><div class="label">🚫 Blocked</div><div class="val">{{BLOCKED}}</div></div>
 </div>
 <div class="info">
-<h2>🟢 System Status</h2>
-<div class="status">ONLINE 24/7 - Safe Mode</div>
-<p style="margin-top:15px">Uptime: <strong>{{uptime}}</strong></p>
-<p>Block Rate: <strong>{{block_rate}}%</strong></p>
+<h2>🎯 How It Actually Works</h2>
+<div class="feature">✅ JavaScript Challenge - Only real browsers can solve</div>
+<div class="feature">✅ Browser Fingerprinting - Canvas, timezone, hardware</div>
+<div class="feature">✅ Timing Analysis - Bots respond too fast</div>
+<div class="feature">✅ Math Challenge - Interactive verification</div>
+<div class="feature">✅ Cookie-based Session - 1 hour validity</div>
+<div class="feature">🚫 Blocks: curl, wget, benchmark tools, scrapers</div>
 </div>
 <div class="info">
-<h2>✅ Protection Policy</h2>
-<div class="feature">✅ Real browsers ALWAYS allowed (Chrome, Safari, Firefox, Edge)</div>
-<div class="feature">✅ Mobile browsers protected</div>
-<div class="feature">✅ Only block confirmed bots (curl, scrapy, etc.)</div>
-<div class="feature">✅ High rate limit: 500 req/min for humans</div>
-<div class="feature">⚠️ Only block at 300+ req/min for browsers</div>
+<h2>📊 Rate Limits</h2>
+<div class="feature">Verified Browsers: 500 req/min ✅</div>
+<div class="feature">Unverified/Bots: 10 req/min ⚠️</div>
+<div class="feature">Over limit: Auto-blocked for 10 minutes 🚫</div>
 </div>
 <div class="info">
-<h2>🌐 API Endpoints</h2>
-<p style="margin:10px 0;font-family:monospace">GET / - Dashboard (You are here!)</p>
-<p style="margin:10px 0;font-family:monospace">GET /api/stats - Statistics</p>
-<p style="margin:10px 0;font-family:monospace">GET /api/test - Test endpoint</p>
-<p style="margin:10px 0;font-family:monospace">POST /api/data - Submit data</p>
+<h2>🧪 Test It</h2>
+<div class="feature">Browser: Open this page - Should pass challenge</div>
+<div class="feature">curl/wget: Try curl {{URL}} - Should be blocked</div>
+<div class="feature">Benchmark: Use ab/siege - Should be blocked</div>
 </div>
 <button class="btn" onclick="location.reload()">🔄 Refresh Stats</button>
 </div>
 <script>setTimeout(()=>location.reload(),15000)</script>
-</body></html>
-"""
+</body>
+</html>"""
+
+@app.before_request
+def protection():
+    """Main protection layer"""
+    # Skip internal endpoints
+    if request.path in ['/verify-challenge', '/health', '/favicon.ico']:
+        return
+    
+    stats['total'] += 1
+    ip = request.remote_addr
+    ua = request.headers.get('User-Agent', '')
+    token = request.cookies.get('browser_token')
+    
+    # 1. Check if blocked
+    if is_blocked(ip):
+        stats['blocked'] += 1
+        count = len(request_tracker.get(ip, []))
+        html = BLOCKED_PAGE.replace('{{IP}}', ip).replace('{{REASON}}', 'Rate limit exceeded').replace('{{COUNT}}', str(count))
+        return html, 403
+    
+    # 2. Check if verified browser
+    if token and token in verified_browsers:
+        data = verified_browsers[token]
+        if time.time() < data['expires'] and data['ip'] == ip:
+            # Verified browser - check rate
+            allowed, count = check_rate(ip, True)
+            if allowed:
+                stats['browser'] += 1
+                return
+            else:
+                # Browser spam too much
+                block_ip(ip)
+                stats['blocked'] += 1
+                html = BLOCKED_PAGE.replace('{{IP}}', ip).replace('{{REASON}}', 'Too many requests').replace('{{COUNT}}', str(count))
+                return html, 429
+    
+    # 3. Check if obvious bot (benchmark tools, curl, etc.)
+    if is_obvious_bot(ua):
+        # Bot detected - strict rate limit
+        allowed, count = check_rate(ip, False)
+        if allowed:
+            stats['bot'] += 1
+            return  # Allow but count as bot
+        else:
+            # Bot exceeded limit - BLOCK
+            block_ip(ip)
+            stats['blocked'] += 1
+            html = BLOCKED_PAGE.replace('{{IP}}', ip).replace('{{REASON}}', 'Bot rate limit exceeded').replace('{{COUNT}}', str(count))
+            return html, 403
+    
+    # 4. Looks like browser but not verified - CHALLENGE
+    if is_browser(ua):
+        stats['challenged'] += 1
+        
+        # Generate challenge
+        challenge_id = secrets.token_urlsafe(16)
+        a = secrets.randbelow(20) + 1
+        b = secrets.randbelow(20) + 1
+        
+        challenge_tracker[ip] = {
+            'challenge_id': challenge_id,
+            'answer': a + b,
+            'issued_at': time.time()
+        }
+        
+        html = CHALLENGE_PAGE.replace('{{CHALLENGE_ID}}', challenge_id).replace('{{REDIRECT}}', request.url)
+        return html, 200
+    
+    # 5. Unknown user agent - treat as bot
+    allowed, count = check_rate(ip, False)
+    if not allowed:
+        block_ip(ip)
+        stats['blocked'] += 1
+        html = BLOCKED_PAGE.replace('{{IP}}', ip).replace('{{REASON}}', 'Unknown client').replace('{{COUNT}}', str(count))
+        return html, 403
+
+@app.route('/verify-challenge', methods=['POST'])
+def verify_challenge():
+    """Verify challenge response"""
+    data = request.get_json()
+    ip = request.remote_addr
+    
+    challenge_id = data.get('challenge_id')
+    answer = data.get('answer')
+    fingerprint = data.get('fingerprint')
+    time_taken = data.get('time_taken', 0)
+    
+    # Verify
+    if verify_challenge_response(ip, challenge_id, answer):
+        # Challenge passed! Generate token
+        token = secrets.token_urlsafe(32)
+        verified_browsers[token] = {
+            'ip': ip,
+            'fingerprint': fingerprint,
+            'expires': time.time() + VERIFIED_DURATION
+        }
+        
+        return jsonify({'verified': True, 'token': token})
+    else:
+        return jsonify({'verified': False, 'reason': 'Challenge failed'})
 
 @app.route('/')
-def dashboard():
-    uptime = int(time.time() - stats['start'])
-    h, m = uptime // 3600, (uptime % 3600) // 60
-    block_rate = round(stats['blocked'] / stats['total'] * 100, 1) if stats['total'] > 0 else 0
-    return render_template_string(DASHBOARD, stats=stats, uptime=f"{h}h {m}m", block_rate=block_rate)
-
-@app.route('/api/stats')
-def get_stats():
-    return jsonify({
-        'stats': stats,
-        'blocked_ips': len(blocked_ips),
-        'tracked_ips': len(request_history),
-        'uptime': int(time.time() - stats['start'])
-    })
+def home():
+    html = DASHBOARD
+    html = html.replace('{{TOTAL}}', str(stats['total']))
+    html = html.replace('{{BROWSER}}', str(stats['browser']))
+    html = html.replace('{{BOT}}', str(stats['bot']))
+    html = html.replace('{{BLOCKED}}', str(stats['blocked']))
+    html = html.replace('{{URL}}', request.url_root)
+    return html
 
 @app.route('/api/test')
 def test():
-    ip = get_remote_address()
-    ua = request.headers.get('User-Agent', '')
-    is_browser = is_real_browser(ua)
     return jsonify({
         'status': 'success',
-        'message': 'You are verified!',
-        'ip': ip,
-        'user_agent': ua,
-        'detected_as': 'Real Browser ✅' if is_browser else 'API Client/Bot',
-        'note': 'Real browsers are never blocked!'
+        'message': 'You passed the protection!',
+        'ip': request.remote_addr,
+        'type': 'Verified Browser' if request.cookies.get('browser_token') else 'Unknown'
     })
 
-@app.route('/api/data', methods=['POST'])
-def submit():
-    return jsonify({'status': 'success', 'received': request.get_json() or {}})
+@app.route('/api/stats')
+def get_stats():
+    return jsonify(stats)
 
 @app.route('/health')
 def health():
-    return jsonify({'status': 'healthy', 'uptime': int(time.time() - stats['start'])})
-
-@app.route('/api/whitelist/<ip>')
-def whitelist(ip):
-    """Thêm IP vào whitelist"""
-    trusted_ips.add(ip)
-    return jsonify({'status': 'success', 'whitelisted': ip})
-
-# Cleanup thread
-def cleanup():
-    while True:
-        time.sleep(300)
-        now = time.time()
-        for ip in list(request_history.keys()):
-            request_history[ip] = [t for t in request_history[ip] if now - t < 60]
-            if not request_history[ip]:
-                del request_history[ip]
-        for ip in list(blocked_ips.keys()):
-            block_time, duration = blocked_ips[ip]
-            if now - block_time >= duration:
-                del blocked_ips[ip]
-
-threading.Thread(target=cleanup, daemon=True).start()
+    return jsonify({'status': 'healthy', 'stats': stats})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
