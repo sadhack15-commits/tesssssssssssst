@@ -73,22 +73,20 @@ def block_ip(ip):
     blocked_ips[ip] = time.time() + BLOCK_DURATION
 
 def verify_challenge_response(ip, challenge_id, answer):
-    """Verify challenge - CHỈ browser thật mới trả lời đúng được"""
+    """Verify challenge - CHỈ cần đáp án đúng"""
     if ip not in challenge_tracker:
         return False
     
     challenge_data = challenge_tracker[ip]
     
-    # Check timeout - bot thường trả lời tức thì, browser mất ~2-5s
+    # Check timeout - Cho phép từ 0s đến 30s
     time_taken = time.time() - challenge_data['issued_at']
-    if time_taken < 1.5:  # Quá nhanh = bot
-        return False
-    if time_taken > CHALLENGE_TIMEOUT:  # Quá chậm = timeout
+    if time_taken > 30:  # Chỉ timeout nếu quá 30s
         return False
     
-    # Check answer
+    # Check answer - Quan trọng nhất
     expected = challenge_data['answer']
-    if str(answer) != str(expected):
+    if int(answer) != int(expected):
         return False
     
     return True
@@ -153,7 +151,7 @@ var fingerprint = {
     })()
 };
 
-// Show challenge after 2 seconds
+// Show challenge after 1 second (nhanh hơn)
 setTimeout(function(){
     document.getElementById('spinner').style.display = 'none';
     document.getElementById('challenge').style.display = 'block';
@@ -170,14 +168,22 @@ setTimeout(function(){
         fingerprint: fingerprint,
         startTime: Date.now()
     };
-}, 2000);
+}, 1000);
 
 function submitAnswer(){
-    var userAnswer = document.getElementById('answer').value;
+    var userAnswer = parseInt(document.getElementById('answer').value);
     var timeTaken = Date.now() - window.challengeData.startTime;
+    
+    // Validate input
+    if(isNaN(userAnswer)){
+        document.getElementById('error').textContent = 'Please enter a number';
+        document.getElementById('error').style.display = 'block';
+        return;
+    }
     
     if(userAnswer == window.challengeData.answer){
         // Correct! Submit to server
+        document.getElementById('error').style.display = 'none';
         fetch('/verify-challenge', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
@@ -194,14 +200,20 @@ function submitAnswer(){
                 document.cookie = 'browser_token=' + data.token + ';path=/;max-age=3600';
                 window.location.href = '{{REDIRECT}}';
             }else{
+                document.getElementById('error').textContent = 'Verification failed. Please try again.';
                 document.getElementById('error').style.display = 'block';
             }
+        })
+        .catch(err => {
+            document.getElementById('error').textContent = 'Network error. Please try again.';
+            document.getElementById('error').style.display = 'block';
         });
     }else{
+        document.getElementById('error').textContent = 'Incorrect answer. Please try again.';
         document.getElementById('error').style.display = 'block';
         setTimeout(function(){
             document.getElementById('error').style.display = 'none';
-        }, 2000);
+        }, 3000);
     }
 }
 
